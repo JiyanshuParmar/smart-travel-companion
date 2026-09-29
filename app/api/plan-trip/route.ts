@@ -4,60 +4,49 @@ import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 
 /* ============================================================
-   ITINERARY VALIDATION SCHEMA
+   ITINERARY VALIDATION
    ============================================================ */
+
+const activitySchema = z.object({
+  time: z.string().min(1),
+  title: z.string().min(1),
+  description: z.string().min(1),
+  category: z.enum([
+    "Food",
+    "Nature",
+    "Culture",
+    "Adventure",
+    "Relaxation",
+    "Sightseeing",
+    "Travel",
+  ]),
+  estimatedCostInr: z.coerce.number().nonnegative(),
+  location: z.string().min(1),
+});
+
+const daySchema = z.object({
+  day: z.coerce.number().int().positive(),
+  title: z.string().min(1),
+  activities: z.array(activitySchema).min(1).max(4),
+});
+
+const recommendationSchema = z.object({
+  type: z.enum(["PLACE", "BUSINESS"]),
+  name: z.string().min(1),
+  description: z.string().min(1),
+  reason: z.string().min(1),
+  estimatedCostInr: z.coerce.number().nonnegative(),
+});
 
 const itinerarySchema = z.object({
   title: z.string().min(1),
   summary: z.string().min(1),
-
-  estimatedMinInr: z.number().nonnegative(),
-  estimatedMaxInr: z.number().nonnegative(),
-
-  days: z.array(
-    z.object({
-      day: z.number().int().positive(),
-      title: z.string().min(1),
-
-      activities: z.array(
-        z.object({
-          time: z.string().min(1),
-          title: z.string().min(1),
-          description: z.string().min(1),
-
-          category: z.enum([
-            "Food",
-            "Nature",
-            "Culture",
-            "Adventure",
-            "Relaxation",
-            "Sightseeing",
-            "Travel",
-          ]),
-
-          estimatedCostInr: z.number().nonnegative(),
-          location: z.string().min(1),
-        }),
-      ),
-    }),
-  ),
-
-  recommendations: z.array(
-    z.object({
-      type: z.enum(["PLACE", "BUSINESS"]),
-      name: z.string().min(1),
-      description: z.string().min(1),
-      reason: z.string().min(1),
-      estimatedCostInr: z.number().nonnegative(),
-    }),
-  ),
-
-  travelNotes: z.array(z.string()),
+  estimatedMinInr: z.coerce.number().nonnegative(),
+  estimatedMaxInr: z.coerce.number().nonnegative(),
+  days: z.array(daySchema).min(1),
+  recommendations: z.array(recommendationSchema).max(6),
+  travelNotes: z.array(z.string()).max(8),
 });
-
-/* ============================================================
-   REQUEST VALIDATION
-   ============================================================ */
 
 const requestSchema = z.object({
   tripId: z.string().uuid(),
@@ -67,14 +56,12 @@ const requestSchema = z.object({
    TYPES
    ============================================================ */
 
-type OpenRouterMessage = {
-  content?: unknown;
-  refusal?: unknown;
-};
-
 type OpenRouterResponse = {
   choices?: Array<{
-    message?: OpenRouterMessage;
+    message?: {
+      content?: unknown;
+      refusal?: unknown;
+    };
   }>;
 
   error?: {
@@ -84,7 +71,7 @@ type OpenRouterResponse = {
 };
 
 /* ============================================================
-   HELPER: EXTRACT TEXT FROM AI MESSAGE
+   EXTRACT AI CONTENT
    ============================================================ */
 
 function getMessageContent(content: unknown): string {
@@ -93,23 +80,22 @@ function getMessageContent(content: unknown): string {
   }
 
   if (Array.isArray(content)) {
-    const textParts = content
+    return content
       .map((part) => {
         if (
           typeof part === "object" &&
           part !== null &&
           "text" in part
         ) {
-          const value = (part as { text?: unknown }).text;
-
-          return typeof value === "string" ? value : "";
+          const text = (part as { text?: unknown }).text;
+          return typeof text === "string" ? text : "";
         }
 
         return "";
       })
-      .filter(Boolean);
-
-    return textParts.join("").trim();
+      .filter(Boolean)
+      .join("")
+      .trim();
   }
 
   if (
@@ -127,41 +113,35 @@ function getMessageContent(content: unknown): string {
 }
 
 /* ============================================================
-   HELPER: CLEAN COMMON AI JSON FORMATTING PROBLEMS
+   EXTRACT JSON FROM MODEL RESPONSE
    ============================================================ */
 
-function cleanAIJsonText(text: string): string {
+function extractJson(text: string): unknown | null {
   let cleaned = text.trim();
 
-  /*
-   * Remove Markdown code fences.
-   *
-   * Example:
-   *
-   * ```json
-   * {
-   *   ...
-   * }
-   * ```
-   */
+  if (!cleaned) {
+    return null;
+  }
 
+  // Remove markdown fences.
   cleaned = cleaned
     .replace(/^```json\s*/i, "")
     .replace(/^```\s*/i, "")
     .replace(/\s*```$/i, "")
     .trim();
 
+  // First try direct JSON parsing.
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Continue with extraction.
+  }
+
   /*
-   * Some models occasionally add a sentence before JSON.
-   *
-   * Example:
+   * Some models write:
    *
    * Here is your itinerary:
-   * {
-   *   ...
-   * }
-   *
-   * Find the first { and last } and keep that section.
+   * { ... }
    */
 
   const firstBrace = cleaned.indexOf("{");
@@ -172,104 +152,67 @@ function cleanAIJsonText(text: string): string {
     lastBrace !== -1 &&
     lastBrace > firstBrace
   ) {
-    cleaned = cleaned.slice(
+    const candidate = cleaned.slice(
       firstBrace,
       lastBrace + 1,
     );
+
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return null;
+    }
   }
 
-  return cleaned.trim();
+  return null;
 }
 
 /* ============================================================
-   HELPER: PARSE AI JSON SAFELY
-   ============================================================ */
-
-function parseAIJson(content: unknown): unknown | null {
-  if (
-    typeof content === "object" &&
-    content !== null
-  ) {
-    return content;
-  }
-
-  const text = getMessageContent(content);
-
-  if (!text) {
-    return null;
-  }
-
-  const cleaned = cleanAIJsonText(text);
-
-  if (!cleaned) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    return null;
-  }
-}
-
-/* ============================================================
-   HELPER: OPENROUTER REQUEST
+   OPENROUTER REQUEST
    ============================================================ */
 
 async function callOpenRouter(
   apiKey: string,
   prompt: string,
-  useJsonMode = true,
+  useJsonMode: boolean,
 ): Promise<OpenRouterResponse> {
   const controller = new AbortController();
 
   const timeout = setTimeout(() => {
     controller.abort();
-  }, 60000);
+  }, 75000);
 
   try {
-    const requestBody: Record<string, unknown> = {
+    const body: Record<string, unknown> = {
       model: "openrouter/free",
 
       messages: [
         {
           role: "system",
-          content: `
-You are the Smart Travel Companion itinerary engine.
-
-You MUST return exactly one JSON object.
-
-Do not use Markdown.
-Do not use code fences.
-Do not write explanations before or after the JSON.
-Do not include comments.
-Do not include trailing commas.
-
-Follow the requested structure exactly.
-          `.trim(),
+          content:
+            "You are a travel itinerary JSON generator. Return ONLY valid JSON. Never use Markdown.",
         },
-
         {
           role: "user",
           content: prompt,
         },
       ],
 
-      temperature: 0.4,
+      temperature: 0.2,
 
       /*
-       * Gives the model enough room for multi-day itineraries.
+       * More room for multi-day itinerary JSON.
        */
-      max_tokens: 7000,
+      max_tokens: 10000,
     };
 
     /*
-     * JSON mode is more compatible with OpenAI-compatible
-     * providers than relying on a provider-specific strict
-     * JSON schema.
+     * JSON mode is attempted first.
+     * If a free model/provider does not support it,
+     * the caller retries without it.
      */
     if (useJsonMode) {
-      requestBody.response_format = {
+      body.response_format = {
         type: "json_object",
       };
     }
@@ -278,36 +221,34 @@ Follow the requested structure exactly.
       "https://openrouter.ai/api/v1/chat/completions",
       {
         method: "POST",
-
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
-
-          /*
-           * These are recommended OpenRouter headers.
-           */
           "HTTP-Referer": "http://localhost:3000",
           "X-Title": "Smart Travel Companion",
         },
-
-        body: JSON.stringify(requestBody),
-
+        body: JSON.stringify(body),
         signal: controller.signal,
       },
     );
 
-    const data =
-      (await response.json()) as OpenRouterResponse;
+    let data: OpenRouterResponse;
+
+    try {
+      data =
+        (await response.json()) as OpenRouterResponse;
+    } catch {
+      throw new Error(
+        `OpenRouter returned an invalid response. HTTP ${response.status}.`,
+      );
+    }
 
     if (!response.ok) {
-      console.error(
-        "OpenRouter HTTP error:",
-        response.status,
-        data,
-      );
+      const providerMessage =
+        data?.error?.message;
 
       throw new Error(
-        data?.error?.message ||
+        providerMessage ||
           `OpenRouter returned HTTP ${response.status}.`,
       );
     }
@@ -319,27 +260,93 @@ Follow the requested structure exactly.
 }
 
 /* ============================================================
-   MAIN POST HANDLER
+   COMPACT DATABASE CONTEXT
+   ============================================================ */
+
+function compactPlace(place: {
+  id: string;
+  title: string;
+  category: string;
+  state: string;
+  district: string | null;
+  location_name: string;
+  short_description: string;
+  estimated_cost_inr: number | null;
+}) {
+  return {
+    id: place.id,
+    name: place.title,
+    category: place.category,
+    state: place.state,
+    district: place.district,
+    location: place.location_name,
+    description: place.short_description,
+    cost: place.estimated_cost_inr,
+  };
+}
+
+function compactBusiness(business: {
+  id: string;
+  business_name: string;
+  business_type: string;
+  short_description: string | null;
+  state: string;
+  district: string | null;
+  city: string;
+  rating: number;
+}) {
+  return {
+    id: business.id,
+    name: business.business_name,
+    type: business.business_type,
+    description: business.short_description,
+    state: business.state,
+    district: business.district,
+    city: business.city,
+    rating: business.rating,
+  };
+}
+
+function compactListing(listing: {
+  id: string;
+  business_id: string;
+  title: string;
+  description: string | null;
+  listing_type: string;
+  price_inr: number;
+  pricing_unit: string;
+  duration_minutes: number | null;
+}) {
+  return {
+    id: listing.id,
+    businessId: listing.business_id,
+    title: listing.title,
+    description: listing.description,
+    type: listing.listing_type,
+    price: listing.price_inr,
+    pricingUnit: listing.pricing_unit,
+    durationMinutes: listing.duration_minutes,
+  };
+}
+
+/* ============================================================
+   MAIN API
    ============================================================ */
 
 export async function POST(request: Request) {
-  console.log("=================================");
-  console.log("SMART TRAVEL AI PLANNER STARTED");
-  console.log("=================================");
+  console.log(
+    "===== SMART TRAVEL AI START =====",
+  );
 
   try {
     /* ---------------------------------------------------------
-       1. CHECK API KEY
+       1. API KEY
        --------------------------------------------------------- */
 
     const apiKey =
       process.env.OPENROUTER_API_KEY;
 
     if (!apiKey) {
-      console.error(
-        "OPENROUTER_API_KEY is missing.",
-      );
-
       return NextResponse.json(
         {
           success: false,
@@ -351,7 +358,7 @@ export async function POST(request: Request) {
     }
 
     /* ---------------------------------------------------------
-       2. VALIDATE REQUEST
+       2. REQUEST
        --------------------------------------------------------- */
 
     let body: unknown;
@@ -368,10 +375,10 @@ export async function POST(request: Request) {
       );
     }
 
-    const parsedRequest =
+    const requestResult =
       requestSchema.safeParse(body);
 
-    if (!parsedRequest.success) {
+    if (!requestResult.success) {
       return NextResponse.json(
         {
           success: false,
@@ -382,31 +389,20 @@ export async function POST(request: Request) {
     }
 
     const { tripId } =
-      parsedRequest.data;
-
-    console.log("Trip ID:", tripId);
+      requestResult.data;
 
     /* ---------------------------------------------------------
-       3. SUPABASE
+       3. SUPABASE + AUTH
        --------------------------------------------------------- */
 
     const supabase = await createClient();
 
-    /* ---------------------------------------------------------
-       4. AUTHENTICATION
-       --------------------------------------------------------- */
-
     const {
       data: { user },
-      error: userError,
+      error: authError,
     } = await supabase.auth.getUser();
 
-    if (userError || !user) {
-      console.error(
-        "Authentication failed:",
-        userError,
-      );
-
+    if (authError || !user) {
       return NextResponse.json(
         {
           success: false,
@@ -417,13 +413,8 @@ export async function POST(request: Request) {
       );
     }
 
-    console.log(
-      "Authenticated user:",
-      user.id,
-    );
-
     /* ---------------------------------------------------------
-       5. FETCH TRIP
+       4. FETCH TRIP
        --------------------------------------------------------- */
 
     const {
@@ -463,112 +454,77 @@ export async function POST(request: Request) {
       );
     }
 
-    console.log(
-      "Trip found:",
-      trip.destination,
-    );
-
     /* ---------------------------------------------------------
-       6. FETCH APPROVED PLACES
+       5. FETCH APPROVED PLACES
        --------------------------------------------------------- */
 
-    const {
-      data: places,
-      error: placesError,
-    } = await supabase
-      .from("places")
-      .select(
-        `
-        id,
-        title,
-        category,
-        state,
-        district,
-        location_name,
-        short_description,
-        detailed_backstory,
-        insider_tip,
-        best_time_to_visit,
-        estimated_cost_inr
-      `,
-      )
-      .eq("moderation_status", "APPROVED")
-      .limit(30);
-
-    if (placesError) {
-      console.error(
-        "Places fetch error:",
-        placesError,
-      );
-    }
+    const { data: places } =
+      await supabase
+        .from("places")
+        .select(
+          `
+          id,
+          title,
+          category,
+          state,
+          district,
+          location_name,
+          short_description,
+          estimated_cost_inr
+        `,
+        )
+        .eq(
+          "moderation_status",
+          "APPROVED",
+        )
+        .limit(40);
 
     /* ---------------------------------------------------------
-       7. FETCH APPROVED BUSINESSES
+       6. FETCH APPROVED BUSINESSES
        --------------------------------------------------------- */
 
-    const {
-      data: businesses,
-      error: businessesError,
-    } = await supabase
-      .from("businesses")
-      .select(
-        `
-        id,
-        business_name,
-        business_type,
-        short_description,
-        description,
-        state,
-        district,
-        city,
-        rating,
-        review_count
-      `,
-      )
-      .eq("status", "APPROVED")
-      .limit(30);
-
-    if (businessesError) {
-      console.error(
-        "Businesses fetch error:",
-        businessesError,
-      );
-    }
+    const { data: businesses } =
+      await supabase
+        .from("businesses")
+        .select(
+          `
+          id,
+          business_name,
+          business_type,
+          short_description,
+          state,
+          district,
+          city,
+          rating
+        `,
+        )
+        .eq("status", "APPROVED")
+        .limit(40);
 
     /* ---------------------------------------------------------
-       8. FETCH APPROVED LISTINGS
+       7. FETCH APPROVED LISTINGS
        --------------------------------------------------------- */
 
-    const {
-      data: listings,
-      error: listingsError,
-    } = await supabase
-      .from("listings")
-      .select(
-        `
-        id,
-        business_id,
-        title,
-        description,
-        listing_type,
-        price_inr,
-        pricing_unit,
-        max_guests,
-        duration_minutes
-      `,
-      )
-      .eq("status", "APPROVED")
-      .limit(50);
-
-    if (listingsError) {
-      console.error(
-        "Listings fetch error:",
-        listingsError,
-      );
-    }
+    const { data: listings } =
+      await supabase
+        .from("listings")
+        .select(
+          `
+          id,
+          business_id,
+          title,
+          description,
+          listing_type,
+          price_inr,
+          pricing_unit,
+          duration_minutes
+        `,
+        )
+        .eq("status", "APPROVED")
+        .limit(60);
 
     /* ---------------------------------------------------------
-       9. FILTER RELEVANT DATA
+       8. DESTINATION FILTER
        --------------------------------------------------------- */
 
     const destination =
@@ -576,84 +532,95 @@ export async function POST(request: Request) {
         .trim()
         .toLowerCase();
 
-    const relevantPlaces =
-      places?.filter((place) => {
-        const searchableText = [
-          place.title,
-          place.category,
-          place.state,
-          place.district,
-          place.location_name,
-          place.short_description,
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase();
+    const matchingPlaces =
+      (places ?? []).filter(
+        (place) => {
+          const text = [
+            place.title,
+            place.category,
+            place.state,
+            place.district,
+            place.location_name,
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase();
 
-        return (
-          searchableText.includes(
-            destination,
-          ) ||
-          destination.includes(
-            searchableText,
-          )
-        );
-      }) ?? [];
+          return (
+            text.includes(destination) ||
+            destination.includes(text)
+          );
+        },
+      );
 
-    const relevantBusinesses =
-      businesses?.filter((business) => {
-        const searchableText = [
-          business.business_name,
-          business.business_type,
-          business.short_description,
-          business.description,
-          business.state,
-          business.district,
-          business.city,
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase();
+    const matchingBusinesses =
+      (businesses ?? []).filter(
+        (business) => {
+          const text = [
+            business.business_name,
+            business.business_type,
+            business.state,
+            business.district,
+            business.city,
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase();
 
-        return (
-          searchableText.includes(
-            destination,
-          ) ||
-          destination.includes(
-            searchableText,
-          )
-        );
-      }) ?? [];
+          return (
+            text.includes(destination) ||
+            destination.includes(text)
+          );
+        },
+      );
 
-    const relevantBusinessIds =
+    const matchingBusinessIds =
       new Set(
-        relevantBusinesses.map(
-          (business) =>
-            business.id,
+        matchingBusinesses.map(
+          (business) => business.id,
         ),
       );
 
-    const relevantListings =
-      listings?.filter((listing) =>
-        relevantBusinessIds.has(
-          listing.business_id,
-        ),
-      ) ?? [];
+    const matchingListings =
+      (listings ?? []).filter(
+        (listing) =>
+          matchingBusinessIds.has(
+            listing.business_id,
+          ),
+      );
 
-    const placesForAI =
-      relevantPlaces.length > 0
-        ? relevantPlaces
-        : places ?? [];
+    /*
+     * IMPORTANT:
+     *
+     * Do NOT send the entire database to the AI.
+     *
+     * Keep the context small so the free model has
+     * enough room to produce the actual itinerary.
+     */
 
-    const businessesForAI =
-      relevantBusinesses.length > 0
-        ? relevantBusinesses
-        : businesses ?? [];
+    const placesForAI = (
+      matchingPlaces.length > 0
+        ? matchingPlaces
+        : places ?? []
+    )
+      .slice(0, 10)
+      .map(compactPlace);
 
-    const listingsForAI =
-      relevantListings.length > 0
-        ? relevantListings
-        : listings ?? [];
+    const businessesForAI = (
+      matchingBusinesses.length > 0
+        ? matchingBusinesses
+        : businesses ?? []
+    )
+      .slice(0, 10)
+      .map(compactBusiness);
+
+    const listingsForAI = (
+      matchingListings.length > 0
+        ? matchingListings
+        : listings ?? []
+    )
+      .slice(0, 15)
+      .map(compactListing);
 
     console.log(
       "AI context:",
@@ -666,93 +633,51 @@ export async function POST(request: Request) {
     );
 
     /* ---------------------------------------------------------
-       10. BUILD PROMPT
+       9. PROMPT
        --------------------------------------------------------- */
 
     const prompt = `
-Create a complete travel itinerary for this trip.
+Create a practical local-first travel itinerary.
 
-TRIP INFORMATION
+TRIP
 
-Destination:
-${trip.destination}
+Destination: ${trip.destination}
+Budget: ₹${trip.budget_inr}
+Budget style: ${trip.budget_style}
+Duration: ${trip.duration_days} days
+Pacing: ${trip.pacing_style}
+Interests: ${
+      (trip.interests ?? []).join(", ") ||
+      "General travel"
+    }
 
-Total Budget:
-₹${trip.budget_inr}
+STRICT REQUIREMENTS
 
-Budget Style:
-${trip.budget_style}
+- Return ONLY one valid JSON object.
+- Create EXACTLY ${trip.duration_days} days.
+- Day numbers must be 1 through ${trip.duration_days}.
+- Every day must contain 1 to 3 activities.
+- Keep descriptions short: maximum 2 sentences.
+- Use realistic Indian Rupee costs.
+- estimatedMinInr <= estimatedMaxInr.
+- Keep total estimated cost within or reasonably close to the traveller budget.
+- Match the selected interests.
+- Prioritize local food, culture, nature and authentic experiences.
+- Do not invent named places or businesses.
+- Named places MUST come from APPROVED PLACES.
+- Named businesses MUST come from APPROVED BUSINESSES.
+- Recommendations may contain at most 6 items.
+- Travel notes may contain at most 6 items.
+- Do not use Markdown.
+- Do not use code fences.
+- Do not write anything before or after the JSON.
+- Keep the JSON compact.
 
-Duration:
-${trip.duration_days} days
-
-Pacing:
-${trip.pacing_style}
-
-Interests:
-${
-  (trip.interests ?? []).join(
-    ", ",
-  ) || "General travel"
-}
-
-IMPORTANT RULES
-
-1. Create EXACTLY ${
-      trip.duration_days
-    } days.
-
-2. Every day must contain at least one activity.
-
-3. Keep the itinerary realistic and practical.
-
-4. Respect the traveller's total budget.
-
-5. estimatedMinInr must be less than or equal to estimatedMaxInr.
-
-6. Use Indian Rupees for all costs.
-
-7. Prioritize local food, culture, nature, community tourism,
-   hidden places and authentic experiences.
-
-8. Do NOT invent businesses, places, hotels, restaurants,
-   activities, prices, addresses or booking options.
-
-9. Named places and businesses MUST come from the supplied
-   database context.
-
-10. If the database does not contain enough information for
-    the requested destination, use generic activity descriptions
-    instead of inventing a named business or place.
-
-11. Do not overload each day.
-
-12. Consider realistic travel time.
-
-13. Match the traveller's selected interests.
-
-14. Recommendations must use names from the supplied database
-    whenever a named recommendation is provided.
-
-15. Keep estimated costs realistic.
-
-16. Return ONLY a JSON object.
-
-17. Do not wrap the JSON in Markdown.
-
-18. Do not add any explanation outside the JSON.
-
-19. Keep the response compact enough to fit within the output limit.
-
-20. Use at most 4 activities per day.
-
-21. Use at most 6 recommendations.
-
-EXPECTED JSON STRUCTURE
+JSON SHAPE
 
 {
-  "title": "Trip title",
-  "summary": "Short trip summary",
+  "title": "Short trip title",
+  "summary": "Short summary",
   "estimatedMinInr": 10000,
   "estimatedMaxInr": 15000,
   "days": [
@@ -762,8 +687,8 @@ EXPECTED JSON STRUCTURE
       "activities": [
         {
           "time": "09:00 AM",
-          "title": "Activity title",
-          "description": "Activity description",
+          "title": "Activity",
+          "description": "Short description.",
           "category": "Food",
           "estimatedCostInr": 500,
           "location": "Location"
@@ -774,244 +699,303 @@ EXPECTED JSON STRUCTURE
   "recommendations": [
     {
       "type": "PLACE",
-      "name": "Name",
-      "description": "Description",
-      "reason": "Why it matches the traveller",
+      "name": "Database place name",
+      "description": "Short description.",
+      "reason": "Why it matches.",
       "estimatedCostInr": 500
     }
   ],
   "travelNotes": [
-    "Travel note"
+    "Short travel note"
   ]
 }
 
-APPROVED PLACES FROM OUR DATABASE
+APPROVED PLACES
 
 ${JSON.stringify(
   placesForAI,
-  null,
-  2,
 )}
 
-APPROVED BUSINESSES FROM OUR DATABASE
+APPROVED BUSINESSES
 
 ${JSON.stringify(
   businessesForAI,
-  null,
-  2,
 )}
 
-APPROVED BUSINESS LISTINGS FROM OUR DATABASE
+APPROVED LISTINGS
 
 ${JSON.stringify(
   listingsForAI,
-  null,
-  2,
 )}
 `;
 
     /* ---------------------------------------------------------
-       11. CALL OPENROUTER
+       10. AI ATTEMPTS
        --------------------------------------------------------- */
-
-    console.log(
-      "Calling OpenRouter...",
-    );
-
-    let openRouterData:
-      | OpenRouterResponse
-      | null = null;
 
     let parsedItinerary:
       | unknown
       | null = null;
 
+    let lastAIError =
+      "The AI provider did not return a valid itinerary.";
+
     /*
-     * We allow up to TWO attempts.
+     * Three attempts:
      *
-     * Attempt 1:
-     * JSON mode.
+     * 1. JSON mode.
+     * 2. Normal mode.
+     * 3. Normal mode + ultra compact instructions.
      *
-     * Attempt 2:
-     * JSON mode disabled, but stronger prompt.
-     *
-     * This makes the application much more tolerant of
-     * providers that don't fully support JSON mode.
+     * This handles free-model/provider differences.
      */
 
     for (
       let attempt = 1;
-      attempt <= 2;
+      attempt <= 3;
       attempt++
     ) {
       try {
         console.log(
-          `OpenRouter attempt ${attempt}/2`,
+          `AI attempt ${attempt}/3`,
         );
 
-        openRouterData =
+        let attemptPrompt = prompt;
+
+        if (attempt === 3) {
+          attemptPrompt = `
+Return ONLY valid JSON for this ${trip.duration_days}-day trip.
+
+Destination: ${trip.destination}
+Budget: ₹${trip.budget_inr}
+Pacing: ${trip.pacing_style}
+Interests: ${
+            (trip.interests ?? []).join(
+              ", ",
+            ) || "General"
+          }
+
+You MUST return exactly ${trip.duration_days} day objects.
+
+Each day must contain 1-2 short activities.
+
+Use only named places/businesses from this database:
+
+PLACES:
+${JSON.stringify(
+  placesForAI.slice(0, 6),
+)}
+
+BUSINESSES:
+${JSON.stringify(
+  businessesForAI.slice(0, 6),
+)}
+
+Return this exact structure:
+
+{
+"title":"Trip",
+"summary":"Summary",
+"estimatedMinInr":10000,
+"estimatedMaxInr":15000,
+"days":[
+  {
+    "day":1,
+    "title":"Day 1",
+    "activities":[
+      {
+        "time":"09:00 AM",
+        "title":"Activity",
+        "description":"Short description",
+        "category":"Sightseeing",
+        "estimatedCostInr":500,
+        "location":"Location"
+      }
+    ]
+  }
+],
+"recommendations":[],
+"travelNotes":[]
+}
+
+NO MARKDOWN.
+NO EXPLANATION.
+ONLY JSON.
+`;
+        }
+
+        const data =
           await callOpenRouter(
             apiKey,
-            prompt,
+            attemptPrompt,
             attempt === 1,
           );
 
         const content =
-          openRouterData
-            ?.choices?.[0]
-            ?.message?.content;
+          data?.choices?.[0]?.message
+            ?.content;
 
         if (!content) {
+          lastAIError =
+            "The AI provider returned an empty response.";
+          continue;
+        }
+
+        parsedItinerary =
+          extractJson(
+            getMessageContent(content),
+          );
+
+        if (!parsedItinerary) {
+          lastAIError =
+            "The AI provider returned incomplete JSON.";
+
           console.error(
-            "OpenRouter returned empty content.",
+            `AI attempt ${attempt}: invalid JSON`,
           );
 
           continue;
         }
 
-        parsedItinerary =
-          parseAIJson(content);
-
-        if (parsedItinerary) {
-          console.log(
-            `AI JSON parsed successfully on attempt ${attempt}.`,
+        const validation =
+          itinerarySchema.safeParse(
+            parsedItinerary,
           );
 
-          break;
+        if (!validation.success) {
+          lastAIError =
+            "The AI generated an incomplete itinerary.";
+
+          console.error(
+            `AI attempt ${attempt}: validation failed`,
+            validation.error.flatten(),
+          );
+
+          parsedItinerary = null;
+
+          continue;
         }
 
-        console.error(
-          `AI JSON parsing failed on attempt ${attempt}.`,
+        /*
+         * Extra business validation.
+         */
+
+        const itinerary =
+          validation.data;
+
+        if (
+          itinerary.days.length !==
+          trip.duration_days
+        ) {
+          lastAIError =
+            `The AI generated ${itinerary.days.length} days instead of ${trip.duration_days}.`;
+
+          console.error(
+            "Incorrect day count:",
+            {
+              expected:
+                trip.duration_days,
+              received:
+                itinerary.days.length,
+            },
+          );
+
+          parsedItinerary = null;
+
+          continue;
+        }
+
+        const expectedDays =
+          Array.from(
+            {
+              length:
+                trip.duration_days,
+            },
+            (_, index) =>
+              index + 1,
+          );
+
+        const actualDays =
+          itinerary.days.map(
+            (day) => day.day,
+          );
+
+        const correctDayNumbers =
+          expectedDays.every(
+            (day, index) =>
+              actualDays[index] ===
+              day,
+          );
+
+        if (!correctDayNumbers) {
+          lastAIError =
+            "The AI generated invalid day numbering.";
+
+          parsedItinerary = null;
+
+          continue;
+        }
+
+        if (
+          itinerary.estimatedMinInr >
+          itinerary.estimatedMaxInr
+        ) {
+          lastAIError =
+            "The AI generated an invalid budget range.";
+
+          parsedItinerary = null;
+
+          continue;
+        }
+
+        /*
+         * SUCCESS.
+         */
+
+        parsedItinerary =
+          itinerary;
+
+        console.log(
+          `AI succeeded on attempt ${attempt}.`,
         );
+
+        break;
       } catch (error) {
         console.error(
-          `OpenRouter attempt ${attempt} failed:`,
+          `AI attempt ${attempt} failed:`,
           error,
         );
 
-        /*
-         * If the request timed out, do not waste another
-         * 60 seconds attempting again.
-         */
-        if (
-          error instanceof Error &&
-          error.name === "AbortError"
-        ) {
-          return NextResponse.json(
-            {
-              success: false,
-              error:
-                "The AI request took too long. Please try again.",
-            },
-            { status: 504 },
-          );
-        }
-
-        /*
-         * Retry once for other OpenRouter errors.
-         */
+        lastAIError =
+          error instanceof Error
+            ? error.message
+            : "The AI provider failed.";
       }
     }
 
     /* ---------------------------------------------------------
-       12. FINAL JSON CHECK
+       11. AI FAILURE
        --------------------------------------------------------- */
 
     if (!parsedItinerary) {
-      console.error(
-        "AI failed to return valid JSON after two attempts.",
-      );
-
       return NextResponse.json(
         {
           success: false,
           error:
-            "The AI could not format the itinerary correctly. Please try generating the plan again.",
-        },
-        { status: 502 },
-      );
-    }
-
-    /* ---------------------------------------------------------
-       13. ZOD VALIDATION
-       --------------------------------------------------------- */
-
-    const itineraryResult =
-      itinerarySchema.safeParse(
-        parsedItinerary,
-      );
-
-    if (!itineraryResult.success) {
-      console.error(
-        "AI itinerary validation failed:",
-        itineraryResult.error.flatten(),
-      );
-
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "The AI generated an incomplete itinerary. Please try again.",
+            lastAIError ||
+            "The AI could not generate the itinerary. Please try again.",
         },
         { status: 502 },
       );
     }
 
     const itinerary =
-      itineraryResult.data;
+      parsedItinerary as z.infer<
+        typeof itinerarySchema
+      >;
 
     /* ---------------------------------------------------------
-       14. EXTRA BUSINESS RULE VALIDATION
-       --------------------------------------------------------- */
-
-    if (
-      itinerary.days.length !==
-      trip.duration_days
-    ) {
-      console.error(
-        "AI generated incorrect number of days.",
-        {
-          expected:
-            trip.duration_days,
-          received:
-            itinerary.days.length,
-        },
-      );
-
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "The AI generated an incorrect number of days. Please try again.",
-        },
-        { status: 502 },
-      );
-    }
-
-    if (
-      itinerary.estimatedMinInr >
-      itinerary.estimatedMaxInr
-    ) {
-      console.error(
-        "Invalid estimated budget range.",
-      );
-
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "The AI generated an invalid budget range. Please try again.",
-        },
-        { status: 502 },
-      );
-    }
-
-    console.log(
-      "Itinerary validated successfully.",
-    );
-
-    /* ---------------------------------------------------------
-       15. SAVE ITINERARY
+       12. SAVE ITINERARY
        --------------------------------------------------------- */
 
     const {
@@ -1021,43 +1005,29 @@ ${JSON.stringify(
       .upsert(
         {
           trip_id: trip.id,
-
-          title:
-            itinerary.title,
-
-          summary:
-            itinerary.summary,
-
+          title: itinerary.title,
+          summary: itinerary.summary,
           estimated_min_inr:
             itinerary.estimatedMinInr,
-
           estimated_max_inr:
             itinerary.estimatedMaxInr,
-
-          days:
-            itinerary.days,
-
+          days: itinerary.days,
           recommendations:
             itinerary.recommendations,
-
           travel_notes:
             itinerary.travelNotes,
-
-          ai_model:
-            "openrouter/free",
-
+          ai_model: "openrouter/free",
           updated_at:
             new Date().toISOString(),
         },
         {
-          onConflict:
-            "trip_id",
+          onConflict: "trip_id",
         },
       );
 
     if (itineraryError) {
       console.error(
-        "Itinerary database error:",
+        "Itinerary save error:",
         itineraryError,
       );
 
@@ -1065,18 +1035,14 @@ ${JSON.stringify(
         {
           success: false,
           error:
-            "The itinerary was generated, but saving it failed. Please try again.",
+            "The itinerary was generated, but saving it failed.",
         },
         { status: 500 },
       );
     }
 
-    console.log(
-      "Itinerary saved successfully.",
-    );
-
     /* ---------------------------------------------------------
-       16. UPDATE TRIP STATUS
+       13. UPDATE TRIP
        --------------------------------------------------------- */
 
     const {
@@ -1084,9 +1050,7 @@ ${JSON.stringify(
     } = await supabase
       .from("trips")
       .update({
-        status:
-          "ITINERARY_READY",
-
+        status: "ITINERARY_READY",
         updated_at:
           new Date().toISOString(),
       })
@@ -1101,14 +1065,12 @@ ${JSON.stringify(
     }
 
     /* ---------------------------------------------------------
-       17. SUCCESS
+       14. SUCCESS
        --------------------------------------------------------- */
 
-    console.log("=================================");
     console.log(
-      "SMART TRAVEL AI PLANNER SUCCESS",
+      "===== SMART TRAVEL AI SUCCESS =====",
     );
-    console.log("=================================");
 
     return NextResponse.json({
       success: true,
