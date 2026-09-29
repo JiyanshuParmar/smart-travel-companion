@@ -7,7 +7,7 @@ import { createClient } from "@/lib/supabase/client";
 
 interface NavbarProps {
   onOpenListBusiness?: () => void;
-  onOpenAuth?: () => void;
+  onOpenAuth?: (...args: never[]) => void;
 }
 
 type Profile = {
@@ -91,12 +91,13 @@ export default function Navbar({
     userEmail?.split("@")[0] ||
     "Traveller";
 
-  const initials = displayName
-    .split(" ")
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((word) => word[0]?.toUpperCase())
-    .join("");
+  const initials =
+    displayName
+      .split(" ")
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((word) => word[0]?.toUpperCase())
+      .join("") || "T";
 
   return (
     <header className="sticky top-0 z-50 border-b border-white/10 bg-slate-950/90 backdrop-blur-xl">
@@ -153,7 +154,7 @@ export default function Navbar({
           </Link>
         </nav>
 
-        {/* Desktop Right Side */}
+        {/* Desktop Actions */}
         <div className="hidden items-center gap-3 lg:flex">
           {!loading && profile ? (
             <>
@@ -176,7 +177,7 @@ export default function Navbar({
 
               <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 py-1.5 pl-1.5 pr-3">
                 <div className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-cyan-400 to-blue-600 text-xs font-bold text-white">
-                  {initials || "T"}
+                  {initials}
                 </div>
 
                 <span className="max-w-28 truncate text-sm font-medium text-slate-200">
@@ -204,7 +205,7 @@ export default function Navbar({
               {onOpenAuth ? (
                 <button
                   type="button"
-                  onClick={onOpenAuth}
+                  onClick={() => onOpenAuth()}
                   className="rounded-full bg-white px-5 py-2.5 text-sm font-bold text-slate-950 transition hover:bg-slate-200"
                 >
                   Sign in
@@ -221,7 +222,7 @@ export default function Navbar({
           )}
         </div>
 
-        {/* Mobile Right Side */}
+        {/* Mobile Actions */}
         <div className="flex items-center gap-2 lg:hidden">
           {!loading && profile ? (
             <Link
@@ -231,11 +232,11 @@ export default function Navbar({
                   ? "/business/dashboard"
                   : "/profile"
               }
-              className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-sm font-bold text-white"
               onClick={closeMobileMenu}
               aria-label="Open profile"
+              className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-sm font-bold text-white"
             >
-              {initials || "T"}
+              {initials}
             </Link>
           ) : (
             <Link
